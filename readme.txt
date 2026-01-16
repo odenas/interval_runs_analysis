@@ -14,5 +14,11 @@ Suggest a statistical model that I can fit to the data. The only transformation 
 Then, I would like to identify the peaks and the valley regions of each sample, as well as of the set as a whole. 
 Then, I would like to get a measure of variability of the various parameters.
 
+--- 
 
+TODO:
+move this to github.io blog post ?
+setup github actions to automatically update the blog upon data upload?
+how to deal with changing routines? E.g., once I plateau, I can start adding a new routine. Do I keep this as a standard measurement of fitness or do I just move to the new one?
+* the goal is to measure progression in an interpretable way
 

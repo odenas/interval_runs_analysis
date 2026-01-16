@@ -28,22 +28,18 @@ class WorkoutConfig:
     def total_duration(self) -> int:
         return sum(p.duration_sec for p in self.phases)
 
-
     def iter_phases(self):
         current_time = 0
         for phase in self.phases:
             yield phase, (current_time, current_time + phase.duration_sec)
             current_time += phase.duration_sec
 
-
     def get_windows(self, intensity: str) -> List[Tuple[int, int]]:
         """Calculates (start, end) timestamps for all intervals of given intensity."""
         windows = []
-        current_time = 0
-        for phase in self.phases:
+        for phase, (start, end) in self.iter_phases():
             if phase.intensity == intensity:
-                windows.append((current_time, current_time + phase.duration_sec))
-            current_time += phase.duration_sec
+                windows.append((start, end))
         return windows
 
     def get_cooldown_window(self) -> Tuple[int, int]:
@@ -55,64 +51,6 @@ class WorkoutConfig:
                 return (current_time, current_time + 60)
             current_time += phase.duration_sec
         raise ValueError("No cooldown phase defined in config.")
-    
-
-
-
-def read_csv(file):        
-    df = pd.read_csv(file, skiprows=2).iloc[:, 1:3]
-    if '2025-12-24' in file.stem:
-        pad_df = df.head(110)
-        df = pd.concat([pad_df, df])
-    td = pd.to_timedelta(df['Time'])
-    df['Time_sec'] = td.dt.total_seconds()
-    return df
-
-
-
-def load_preprocess_and_filter(file_paths, kernel_size=11, n_drop=0):
-    """
-    1. Loads CSVs and drops the first N data points.
-    2. Resets time so the first remaining point is t=0.
-    3. Interpolates to a common grid and applies a Median Filter.
-    """
-    processed_dfs = []
-    max_duration = 0
-    
-    # Pass 1: Load, Drop, and find global max time
-    for file in file_paths:
-        df = read_csv(file)
-        
-        # --- Constraint: Drop first N points ---
-        if n_drop > 0:
-            df = df.iloc[n_drop:].reset_index(drop=True)
-            
-        # Convert Time to seconds
-        df['Time_sec'] = pd.to_timedelta(df['Time']).dt.total_seconds()
-        
-        # Shift Time_sec so that the first point after dropping is t=0
-        # This ensures all sessions align at the same relative start point
-        df['Time_sec'] = df['Time_sec'] - df['Time_sec'].iloc[0]
-        
-        if df['Time_sec'].max() > max_duration:
-            max_duration = df['Time_sec'].max()
-            
-        processed_dfs.append(df)
-    
-    common_time = np.arange(0, int(max_duration) + 1, 1)
-    data_list = []
-    
-    for df in processed_dfs:
-        # Interpolate HR onto the common grid
-        hr_interp = np.interp(common_time, df['Time_sec'], df['HR (bpm)'])
-        
-        # Apply Median Filtering to handle Type 1 errors (substantial jitters)
-        hr_cleaned = medfilt(hr_interp, kernel_size=kernel_size)
-        
-        data_list.append(hr_cleaned)
-        
-    return common_time, np.array(data_list)
-
 
 
 @dataclass(frozen=True)
@@ -233,7 +171,6 @@ class TreadmillAnalytic:
     config: WorkoutConfig
 
     # Storage for processed curves
-    n_intervals: int =  field(init=False, repr=False)
     trace: az.InferenceData = field(init=False, repr=False)
     post_mu: np.ndarray = field(init=False, repr=False)  # samples x seconds
     post_accel: np.ndarray = field(init=False, repr=False)
@@ -243,7 +180,6 @@ class TreadmillAnalytic:
     def __post_init__(self, load_cache, cache_path):
         """Coordinates the model fitting and signal generation."""
 
-        self.n_intervals = len(self.config.get_windows("high"))
         n_samples = 1000
         if load_cache and cache_path is not None and cache_path.exists():
             self.trace = az.from_netcdf(cache_path)
@@ -260,25 +196,40 @@ class TreadmillAnalytic:
 
     def get_acceleration_peaks(self) -> List[Tuple[WorkoutPhase, MedianHdi]]:
         results = []
-        for phase, (phase_start, phase_end) in self.config.iter_phases():
-            win = (self.time >= phase_start) & (self.time <= phase_end)
-            # Get the max for EVERY sample in the window (Result: 2000 max values)
-            if phase.intensity == "high":
-                sample_peaks = self.post_accel[:, win].max(axis=1)
-            elif phase.intensity == "low" or phase.intensity == "cooldown":
-                sample_peaks = self.post_accel[:, win].min(axis=1)
+        windows = [(start, end) for (phase, (start, end)) in self.config.iter_phases()]
+        for i, phase in enumerate(self.config.phases):
+            if i == 0:
+                prev_center = 0
+                next_center = (windows[i+1][1] + windows[i+1][0]) // 2
+            elif i == len(windows) - 1:
+                prev_center = (windows[i-1][1] + windows[i-1][0]) // 2
+                next_center = windows[i][1]
             else:
-                raise ValueError(f"Unknown intensity: {phase.intensity}")
-            results.append((phase, MedianHdi.from_samples(sample_peaks)))
+                prev_center = (windows[i-1][1] + windows[i-1][0]) // 2
+                next_center = (windows[i+1][1] + windows[i+1][0]) // 2
+            
+            if phase.intensity in ('cooldown', 'low'):
+                peak_dist = self.post_accel[:, prev_center:next_center].min(axis=1)
+            else:
+                peak_dist = self.post_accel[:, prev_center:next_center].max(axis=1)
+            results.append((phase, MedianHdi.from_samples(peak_dist)))
+            # print(prev_center, next_center, MedianHdi.from_samples(peak_dist))
+
         return results
 
     def get_hrr60(self) -> Tuple[WorkoutPhase, MedianHdi]:
-        for phase, (phase_start, phase_end) in self.config.iter_phases():
-            if phase.name != "Cd":
-                continue
-            delta_dist = 60 * (self.post_mu[:, phase_start] - self.post_mu[:, phase_end]) / phase.duration_sec
-            return (phase, MedianHdi.from_samples(delta_dist))
-        raise ValueError("No cooldown phase defined in config.")
+        # find the last peak
+        ss, se = self.config.get_windows('high')[-1]
+        s_center = (ss + se) // 2
+        cds, cde = self.config.get_windows('cooldown')[-1]
+        cd_center = (cds + cde) // 2
+        assert se == cds
+
+        peak_arg_dist = np.argmax(self.post_mu[:, s_center:cd_center], axis=1) + s_center
+        valley_arg_dist = peak_arg_dist + 60
+        row_args = np.arange(self.post_mu.shape[0])
+        delta_dist = self.post_mu[row_args, peak_arg_dist] - self.post_mu[row_args, valley_arg_dist]
+        return (self.config.phases[-1], MedianHdi.from_samples(delta_dist))
 
     def get_cardiac_costs(self) -> List[Tuple[WorkoutPhase, MedianHdi]]:
         costs = []
@@ -296,43 +247,24 @@ class TreadmillAnalytic:
         return pd.DataFrame([(phase.name, metric.median, metric.hdi_lower, metric.hdi_upper) for phase, metric in results],
                              columns=["Interval", "mean", "low", "high"])
 
-    def get_quadrant_coords(self) -> Tuple[Tuple[WorkoutPhase, MedianHdi], 
-                                           Tuple[WorkoutPhase, MedianHdi], 
-                                           Tuple[WorkoutPhase, MedianHdi]]:
-        # phase, punch_mean, punch_hdi[0], punch_hdi[1]
-        punches = [p for p in self.get_acceleration_peaks() if p[0].intensity == "high"]
-        return punches[0], punches[-1], self.get_hrr60()
-
 
 @dataclass
 class TreadmillReport:
     workout_structure: WorkoutConfig
 
     # time_axis: np.ndarray = field(init=False)
-    sessions: List[TreadmillAnalytic] = field(init=False)
+    sessions: List[TreadmillAnalytic]
     accel_results: List[Tuple[WorkoutPhase, MedianHdi]] = field(init=False)
     hrr60_results: List[Tuple[WorkoutPhase, MedianHdi]] = field(init=False)
     cardiac_cost_results: List[Tuple[WorkoutPhase, MedianHdi]] = field(init=False)
-    data_directory: InitVar[List[Path]]
+    # file_paths: InitVar[List[Path]]
     with_prior: bool
 
-    def __post_init__(self, file_paths: List[Path]):
-        degree = 3
-        session_names = [p.stem[6:16] for p in file_paths]
-        cache_paths = [file_path.with_suffix(".nc") for file_path in file_paths]
-        time_axis, raw_data_matrix = load_preprocess_and_filter(file_paths, kernel_size=1, n_drop=240)
-
-        self.sessions = [
-            TreadmillAnalytic(time_axis, hr_data, sn, degree, self.workout_structure, True, cp) 
-            for hr_data, sn, cp in zip(raw_data_matrix, session_names, cache_paths)
-        ]
+    def __post_init__(self):
         if self.with_prior:
             self.sessions.append(
-                TreadmillAnalytic(time_axis, None, "2026-02-01_00-00-00", degree, self.workout_structure, True, Path("prior.nc"))
+                TreadmillAnalytic(self.sessions[0].time, None, "2026-02-01_00-00-00", self.sessions[0].degree, self.workout_structure, True, Path("prior.nc"))
             )
-        assert len(file_paths) == len(session_names)
-        assert len(file_paths) == raw_data_matrix.shape[0]
-        np.any(np.isnan(raw_data_matrix))
 
     def plot_raw_data(self):
         fig, ax = plt.subplots(1, 1, figsize=(8, 4))
