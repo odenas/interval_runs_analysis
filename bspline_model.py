@@ -5,14 +5,11 @@ import arviz as az
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 from sklearn.preprocessing import SplineTransformer
-from scipy.integrate import trapezoid
 from dataclasses import dataclass, field, InitVar
 from typing import List, Optional, Tuple
 from pathlib import Path
 import seaborn as sns
 from dataclasses import dataclass, field
-import matplotlib.cm as cm
-from scipy.signal import medfilt
 
 @dataclass(frozen=True)
 class WorkoutPhase:
@@ -23,6 +20,7 @@ class WorkoutPhase:
 @dataclass(frozen=True)
 class WorkoutConfig:
     phases: List[WorkoutPhase]
+    name: str
     
     @property
     def total_duration(self) -> int:
@@ -195,6 +193,9 @@ class TreadmillAnalytic:
         assert self.post_accel.shape == (n_samples, self.time.shape[0])
 
     def get_acceleration_peaks(self) -> List[Tuple[WorkoutPhase, MedianHdi]]:
+        """
+        maximum rate of change in your heart rate when you shift phase intensity
+        """
         results = []
         windows = [(start, end) for (phase, (start, end)) in self.config.iter_phases()]
         for i, phase in enumerate(self.config.phases):
@@ -218,6 +219,9 @@ class TreadmillAnalytic:
         return results
 
     def get_hrr60(self) -> Tuple[WorkoutPhase, MedianHdi]:
+        """
+        the decrease in heart rate precisely 60 seconds after the final high-intensity phase ends and the cooldown begins.
+        """
         # find the last peak
         ss, se = self.config.get_windows('high')[-1]
         s_center = (ss + se) // 2
@@ -232,6 +236,8 @@ class TreadmillAnalytic:
         return (self.config.phases[-1], MedianHdi.from_samples(delta_dist))
 
     def get_cardiac_costs(self) -> List[Tuple[WorkoutPhase, MedianHdi]]:
+        """
+        the total number of heartbeats spent during a specific phase"""
         costs = []
         # Get the window for each phase
         for phase, (phase_start, phase_end) in self.config.iter_phases():
@@ -251,13 +257,7 @@ class TreadmillAnalytic:
 @dataclass
 class TreadmillReport:
     workout_structure: WorkoutConfig
-
-    # time_axis: np.ndarray = field(init=False)
     sessions: List[TreadmillAnalytic]
-    accel_results: List[Tuple[WorkoutPhase, MedianHdi]] = field(init=False)
-    hrr60_results: List[Tuple[WorkoutPhase, MedianHdi]] = field(init=False)
-    cardiac_cost_results: List[Tuple[WorkoutPhase, MedianHdi]] = field(init=False)
-    # file_paths: InitVar[List[Path]]
     with_prior: bool
 
     def __post_init__(self):
@@ -280,27 +280,44 @@ class TreadmillReport:
         
 
     def plot_fit_accel(self, fig, axes):
-        n_sessions = len(axes[1])
+        try:
+            n_sessions = len(axes[1])
+        except TypeError:
+                n_sessions = 1
         for i, session in enumerate(self.sessions[-n_sessions:]):
-            ax1, ax2 = axes[0, i], axes[1, i]
+            if n_sessions == 1:
+                ax1, ax2 = axes[0], axes[1]
+            else:
+                ax1, ax2 = axes[0, i], axes[1, i]
             hr_stats = MedianHdiSample.from_samples(session.post_mu, session.post_mu.shape[0])
             acc_stats = MedianHdiSample.from_samples(session.post_accel, session.post_accel.shape[0])
 
             # --- Top Plot: Heart Rate ---
             if session.hr is not None:
                 ax1.scatter(session.time, session.hr, color='black', s=1, alpha=0.2)
-            ax1.plot(session.time, hr_stats.median, color='firebrick', linewidth=2.5, label='Posterior Median HR')
-            ax1.fill_between(session.time, hr_stats.hdi_lower, hr_stats.hdi_upper, color='firebrick', alpha=0.2)
+            ax1.plot(session.time, hr_stats.median, color="#2b88b4", linewidth=1, label='Posterior Median HR')
+            ax1.fill_between(session.time, hr_stats.hdi_lower, hr_stats.hdi_upper, color="#2b88b4", alpha=0.2)
             ax1.set_ylabel("Heart Rate (bpm)")
             ax1.set_title(session.session_id)
             apply_workout_grid(ax1, self.workout_structure)
 
+
             # --- Bottom Plot: Acceleration ---
-            ax2.plot(session.time, acc_stats.median, color='indigo', linewidth=2, label='HR Acceleration')
+            ax2.plot(session.time, acc_stats.median, color="#2b88b4", linewidth=1, label='HR Acceleration')
             ax2.axhline(0, color='black', linewidth=1, alpha=0.5)
-            ax2.fill_between(session.time, acc_stats.hdi_lower, acc_stats.hdi_upper, color='firebrick', alpha=0.2)
+            ax2.fill_between(session.time, acc_stats.hdi_lower, acc_stats.hdi_upper, color="#2b88b4", alpha=0.2)
             ax2.set_ylabel("Acceleration ($\\Delta$BPM/sec)", fontweight='bold')
             ax2.set_xlabel("Time (seconds)", fontweight='bold')
+            # add peak markers            
+            for phase_iter, phase_peaks in zip(session.config.iter_phases(), session.get_acceleration_peaks()):
+                phase: WorkoutPhase = phase_peaks[0]
+                peak: MedianHdi = phase_peaks[1]
+                start, end = phase_iter[1]
+                if phase.intensity in ('low', 'high'):
+                    ax2.plot([start, end], [peak.hdi_lower, peak.hdi_lower], color="#0b0c0c", linewidth=0.2, alpha=0.8, linestyle='-')
+                    ax2.plot([start, end], [peak.hdi_upper, peak.hdi_upper], color="#0b0c0c", linewidth=0.2, alpha=0.8, linestyle='-')
+                    # ax2.errorbar(x=(start+ end) / 2, y=peak.median, yerr=peak.hdi_width,
+                    #              fmt='o', color="#0b0c0c", capsize=0, elinewidth=.5, markersize=2)
             apply_workout_grid(ax2, self.workout_structure)
 
     
@@ -318,16 +335,25 @@ class TreadmillReport:
                                (y_stat.median - y_stat.hdi_lower, y_stat.hdi_upper - y_stat.median)))
 
         for i, (session, (x_mu, y_mu, x_err, y_err)) in enumerate(zip(self.sessions, all_coords)):
-            ax.errorbar(x_mu, y_mu, xerr=[x_err[0]], yerr=[y_err[0]],
-                        fmt='o', color='teal', alpha=0.5, capsize=0, elinewidth=1.2, markersize=4)
+            if i == 0:
+                ax.errorbar(x_mu, y_mu, xerr=[x_err[1]], yerr=[y_err[1]],
+                            fmt='o', color="#7c4e0c", capsize=0, elinewidth=.5, markersize=4)
+
+            elif i > 0 and i < len(self.sessions) - 1:
+                ax.errorbar(x_mu, y_mu, xerr=[x_err[0]], yerr=[y_err[0]],
+                            fmt='s', color="#645b4e", capsize=0, elinewidth=.5, markersize=2)
+            if i == len(self.sessions) - 1:
+                ax.errorbar(x_mu, y_mu, xerr=[x_err[1]], yerr=[y_err[1]],
+                            fmt='o', color="#7c4e0c", capsize=0, elinewidth=.5, markersize=4)
+
             ax.annotate(session.session_id, xy=(x_mu, y_mu), 
                         xytext=(5, 5), textcoords='offset points', fontsize=5, color='#333333')
             
             if i > 0:
                 prev_x, prev_y, _, _ = all_coords[i-1]
                 arrow = FancyArrowPatch((prev_x, prev_y), (x_mu, y_mu),
-                                        arrowstyle='-|>', mutation_scale=15, color='teal',
-                                        linestyle='-', linewidth=1.5, alpha=0.3, shrinkA=5, shrinkB=5)
+                                        arrowstyle='-|>', mutation_scale=15, color='grey',
+                                        linestyle='-', linewidth=.5, alpha=0.4, shrinkA=5, shrinkB=5)
                 ax.add_patch(arrow)
 
         # Formatting
@@ -337,7 +363,7 @@ class TreadmillReport:
             ax.set_ylabel("Recovery (HRR60 - BPM)")
         else:
             ax.set_ylabel("Last Punch (Max Accel - BPM/s)")
-        ax.grid(True, linestyle=':', alpha=0.4)
+        ax.grid(True, linestyle=':', alpha=0.2)
         
 
     def plot_cardiac_cost(self):
