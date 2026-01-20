@@ -11,44 +11,7 @@ from pathlib import Path
 import seaborn as sns
 from dataclasses import dataclass, field
 
-@dataclass(frozen=True)
-class WorkoutPhase:
-    name: str
-    duration_sec: int
-    intensity: str  # 'low', 'high', or 'cooldown'
-
-@dataclass(frozen=True)
-class WorkoutConfig:
-    phases: List[WorkoutPhase]
-    name: str
-    
-    @property
-    def total_duration(self) -> int:
-        return sum(p.duration_sec for p in self.phases)
-
-    def iter_phases(self):
-        current_time = 0
-        for phase in self.phases:
-            yield phase, (current_time, current_time + phase.duration_sec)
-            current_time += phase.duration_sec
-
-    def get_windows(self, intensity: str) -> List[Tuple[int, int]]:
-        """Calculates (start, end) timestamps for all intervals of given intensity."""
-        windows = []
-        for phase, (start, end) in self.iter_phases():
-            if phase.intensity == intensity:
-                windows.append((start, end))
-        return windows
-
-    def get_cooldown_window(self) -> Tuple[int, int]:
-        """Calculates the recovery window (start of cooldown to 60s in)."""
-        current_time = 0
-        for phase in self.phases:
-            # We look for the start of the final 'cooldown' phase
-            if phase.intensity == 'cooldown':
-                return (current_time, current_time + 60)
-            current_time += phase.duration_sec
-        raise ValueError("No cooldown phase defined in config.")
+from workout import WorkoutConfig, WorkoutPhase
 
 
 @dataclass(frozen=True)
@@ -92,40 +55,29 @@ class MedianHdiSample:
         return self.hdi[:, 1]
 
 
-def fit_bayesian_spline(time, hr_data, total_duration, degree, sample_size, knot_every):
-    """
-    Factored model definition. 
-    Returns the basis matrix (B), its derivative (dB_dt), and the MAP weights.
-    """
-    # 1. Create Basis
-    knots = np.array(range(0, total_duration+1, knot_every)).reshape((-1, 1))
-    transformer = SplineTransformer(knots=knots, degree=degree, include_bias=True)
-    B = transformer.fit_transform(time.reshape(-1, 1))
+@dataclass
+class KnotGenerator:
+    time: np.ndarray
+    degree: int
+
+    @property
+    def total_duration(self):
+        return self.time.shape[0]
+
+    def _basis(self, knots):
+        transformer = SplineTransformer(knots=knots, degree=self.degree, include_bias=True)
+        return transformer.fit_transform(self.time.reshape(-1, 1))
+
+    def equally_spaced_cadence(self, knot_spacing):
+        knots = np.array(range(0, self.total_duration+1, knot_spacing)).reshape((-1, 1))
+        return self._basis(knots)
+
+    def equally_spaced_n(self, n_knots):
+        freq = int(self.total_duration / n_knots)
+        return self.equally_spaced_cadence(freq)
     
-    # 2. Compute Derivative Basis
-    # We use gradient here to get the slope of the basis functions
-    dB_dt = np.gradient(B, axis=0)
-
-    # 3. Bayesian Model Definition
-    with pm.Model() as model:
-        w = pm.Normal("w", mu=130, sigma=40, shape=B.shape[1])
-        mu = pm.Deterministic("mu", pm.math.dot(B, w))
-        # Derivative/Punch at every time step
-        accel = pm.Deterministic("accel", pm.math.dot(w, dB_dt.T))
-        
-        sigma = pm.HalfNormal("sigma", sigma=5)
-        if hr_data is None:
-            pm.Normal("obs", mu=mu, sigma=sigma)
-        else:
-            pm.Normal("obs", mu=mu, sigma=sigma, observed=hr_data)
-        
-        # Sampling 1000 draws to build the HDI
-        chains = 2
-        trace = pm.sample(int(sample_size / chains), tune=1000, chains=chains, target_accept=0.9, progressbar=False)
-        
-    return trace, B
-
-
+    def custom(self, knots):
+        return self._basis(knots)
 
 
 
@@ -165,26 +117,26 @@ class TreadmillAnalytic:
     time: np.ndarray
     hr: Optional[np.ndarray]
     session_id: str
-    degree: int
     config: WorkoutConfig
+    trace: az.InferenceData
 
-    # Storage for processed curves
-    trace: az.InferenceData = field(init=False, repr=False)
-    post_mu: np.ndarray = field(init=False, repr=False)  # samples x seconds
-    post_accel: np.ndarray = field(init=False, repr=False)
     load_cache: InitVar[bool] = False
     cache_path: InitVar[Path | None] = None
+
+    # Storage for processed curves
+    post_mu: np.ndarray = field(init=False, repr=False)  # samples x seconds
+    post_accel: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self, load_cache, cache_path):
         """Coordinates the model fitting and signal generation."""
 
         n_samples = 1000
-        if load_cache and cache_path is not None and cache_path.exists():
-            self.trace = az.from_netcdf(cache_path)
-        else:
-            self.trace, _ = fit_bayesian_spline(self.time, self.hr, self.config.total_duration, self.degree, n_samples, 30)
-            self.trace.to_netcdf(cache_path)
-        
+        # if load_cache and cache_path is not None and cache_path.exists():
+        #     self.trace = az.from_netcdf(cache_path)
+        # else:
+        #     self.trace, _ = fit_bayesian_spline(self.hr, self.knot_basis, n_samples)
+        #     self.trace.to_netcdf(cache_path)
+
         # Extract posteriors
         self.post_mu = az.extract(self.trace, var_names="mu").values.T
         self.post_accel = az.extract(self.trace, var_names="accel").values.T
@@ -258,13 +210,6 @@ class TreadmillAnalytic:
 class TreadmillReport:
     workout_structure: WorkoutConfig
     sessions: List[TreadmillAnalytic]
-    with_prior: bool
-
-    def __post_init__(self):
-        if self.with_prior:
-            self.sessions.append(
-                TreadmillAnalytic(self.sessions[0].time, None, "2026-02-01_00-00-00", self.sessions[0].degree, self.workout_structure, True, Path("prior.nc"))
-            )
 
     def plot_raw_data(self):
         fig, ax = plt.subplots(1, 1, figsize=(8, 4))
@@ -371,6 +316,6 @@ class TreadmillReport:
                             .assign(session=s.session_id)
                             .assign(session_date=lambda x: pd.to_datetime(x.session.str[:10]))
                             for s in self.sessions]).reset_index().rename(columns={'mean': 'cc'})
-        ax = sns.pointplot(x='session_date', y='cc', hue='Interval', data=cc_df, legend='brief')
-        ax.set_ylabel("Cardiac Cost (Total Beats)")
-        sns.move_legend(ax, "upper left", bbox_to_anchor=(1, 1))
+        g = sns.catplot(x='session_date', y='cc', hue='Interval', data=cc_df, legend='brief', height=4, aspect=2.5, kind='point')
+        # ax.set_ylabel("Cardiac Cost (Total Beats)")
+        # sns.move_legend(ax, "upper left", bbox_to_anchor=(1, 1))
