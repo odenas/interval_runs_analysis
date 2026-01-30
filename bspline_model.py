@@ -112,37 +112,88 @@ def apply_workout_grid(ax, config: WorkoutConfig):
 
 
 
+
+def fit_bayesian_spline(hr_data, knot_basis,  sample_size):
+    """
+    Factored model definition. 
+    Returns the basis matrix (B), its derivative (dB_dt), and the MAP weights.
+    """
+
+    # 2. Compute Derivative Basis
+    # We use gradient here to get the slope of the basis functions
+    dB_dt = np.gradient(knot_basis, axis=0)
+
+    # 3. Bayesian Model Definition
+    with pm.Model() as model:
+        # tau = pm.Exponential("tau", 0.002)
+        # w = pm.GaussianRandomWalk("w", sigma=tau, shape=B.shape[1])
+        w = pm.Normal("w", mu=130, sigma=40, shape=knot_basis.shape[1])
+        mu = pm.Deterministic("mu", pm.math.dot(knot_basis, w))
+        # Derivative/Punch at every time step
+        accel = pm.Deterministic("accel", pm.math.dot(w, dB_dt.T))
+        
+        sigma = pm.HalfNormal("sigma", sigma=5)
+        pm.StudentT("obs", nu=4, mu=mu, sigma=sigma, observed=hr_data)
+        
+        # Sampling 1000 draws to build the HDI
+        chains = 2
+        trace = pm.sample(int(sample_size / chains), tune=1000, chains=chains, target_accept=0.9, progressbar=False)
+        
+    return trace
+
+
 @dataclass
-class TreadmillAnalytic:
-    time: np.ndarray
+class BsplineModel:
+    knots: np.ndarray
+    time_sec: np.ndarray
     hr: Optional[np.ndarray]
-    session_id: str
-    config: WorkoutConfig
-    trace: az.InferenceData
+    n_samples: int = 1000
 
     load_cache: InitVar[bool] = False
-    cache_path: InitVar[Path | None] = None
+    cache_path: InitVar[Optional[Path]] = None
 
+    trace: az.InferenceData = field(init=False, repr=False)
+
+    def __post_init__(self, load_cache: bool, cache_path: Optional[Path]):
+        """Coordinates the model fitting and signal generation."""
+
+        if load_cache and cache_path is not None and cache_path.exists():
+            self.trace = az.from_netcdf(cache_path)
+        else:
+            knot_generator = KnotGenerator(time=self.time_sec, degree=3)
+            basis = knot_generator.custom(list(sorted(self.knots)))
+
+            self.trace = fit_bayesian_spline(self.hr, basis, self.n_samples)
+            self.trace.to_netcdf(str(cache_path))
+
+
+@dataclass
+class TreadmillAnalytic:
+    model: BsplineModel
+    config: WorkoutConfig
+    session_id: str
+
+    # useful variables
+    time: np.ndarray = field(init=False, repr=False)
+    hr: Optional[np.ndarray] = field(init=False, repr=False)
+    
+    trace: az.InferenceData = field(init=False, repr=False)
     # Storage for processed curves
     post_mu: np.ndarray = field(init=False, repr=False)  # samples x seconds
     post_accel: np.ndarray = field(init=False, repr=False)
 
-    def __post_init__(self, load_cache, cache_path):
+    def __post_init__(self):
         """Coordinates the model fitting and signal generation."""
-
-        n_samples = 1000
-        # if load_cache and cache_path is not None and cache_path.exists():
-        #     self.trace = az.from_netcdf(cache_path)
-        # else:
-        #     self.trace, _ = fit_bayesian_spline(self.hr, self.knot_basis, n_samples)
-        #     self.trace.to_netcdf(cache_path)
+        # shortcut vars
+        self.time = self.model.time_sec
+        self.hr = self.model.hr
+        self.trace = self.model.trace
 
         # Extract posteriors
         self.post_mu = az.extract(self.trace, var_names="mu").values.T
-        self.post_accel = az.extract(self.trace, var_names="accel").values.T
-        
-        assert self.post_mu.shape == (n_samples, self.time.shape[0])
-        assert self.post_accel.shape == (n_samples, self.time.shape[0])
+        self.post_accel = az.extract(self.trace, var_names="accel").values.T        
+        assert self.post_mu.shape == (self.model.n_samples, self.time.shape[0])
+        assert self.post_accel.shape == (self.model.n_samples, self.time.shape[0])
 
     def get_acceleration_peaks(self) -> List[Tuple[WorkoutPhase, MedianHdi]]:
         """
