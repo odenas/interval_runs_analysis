@@ -238,7 +238,7 @@ class TreadmillAnalytic:
         delta_dist = self.post_mu[row_args, peak_arg_dist] - self.post_mu[row_args, valley_arg_dist]
         return (self.config.phases[-1], MedianHdi.from_samples(delta_dist))
 
-    def get_cardiac_costs(self) -> List[Tuple[WorkoutPhase, MedianHdi]]:
+    def get_cardiac_costs(self) -> pd.DataFrame:
         """
         the total number of heartbeats spent during a specific phase"""
         costs = []
@@ -248,13 +248,10 @@ class TreadmillAnalytic:
             # 2. Calculate the cost for every single sample (HR is in BPM, so we divide by 60)
             # This gives you a distribution of 2000 'Total Beats' values
             cardiac_costs_dist = np.trapezoid(self.post_mu[:, win], self.time[win], axis=1) / 60
-            costs.append((phase, MedianHdi.from_samples(cardiac_costs_dist)))
-        return costs
-
-    @staticmethod
-    def results_to_df(results: List[Tuple[WorkoutPhase, MedianHdi]]) -> pd.DataFrame:
-        return pd.DataFrame([(phase.name, metric.median, metric.hdi_lower, metric.hdi_upper) for phase, metric in results],
-                             columns=["Interval", "mean", "low", "high"])
+            # costs.append((phase, MedianHdi.from_samples(cardiac_costs_dist)))
+            (costs.append(pd.DataFrame({"cc": cardiac_costs_dist})
+                          .assign(interval=phase.name, intensity=phase.intensity, session_id=self.session_id)))
+        return pd.concat(costs)
 
 
 @dataclass
@@ -363,10 +360,27 @@ class TreadmillReport:
         
 
     def plot_cardiac_cost(self):
-        cc_df = pd.concat([TreadmillAnalytic.results_to_df(s.get_cardiac_costs())
-                            .assign(session=s.session_id)
-                            .assign(session_date=lambda x: pd.to_datetime(x.session.str[:10]))
-                            for s in self.sessions]).reset_index().rename(columns={'mean': 'cc'})
-        g = sns.catplot(x='session_date', y='cc', hue='Interval', data=cc_df, legend='brief', height=4, aspect=2.5, kind='point')
-        # ax.set_ylabel("Cardiac Cost (Total Beats)")
-        # sns.move_legend(ax, "upper left", bbox_to_anchor=(1, 1))
+        all_costs = []
+        for s in self.sessions:
+            all_costs.append(s.get_cardiac_costs())
+        lldf = pd.concat(all_costs).assign(session_date=lambda x: pd.to_datetime(x.session_id))
+        fig, axes = plt.subplots(3, 1, figsize=(8, 4))
+        for idx,(i, idf) in enumerate(lldf.groupby('intensity')):
+            ax = axes[idx]
+            ax = sns.lineplot(x='session_date', y='cc', hue='interval', data=idf,
+                    legend='brief', err_style='bars',
+                    errorbar=("sd", 2), ax=ax)
+            if idx < 2: 
+                ax.set_xticklabels([])
+            sns.move_legend(ax, "upper left", bbox_to_anchor=(1, 1))
+            ax.set_title(f"intensity={i}")
+        ax.tick_params(axis='x', labelrotation=60) 
+        
+
+        # g = sns.relplot(x='session_date', y='cc', hue='interval', data=lldf,
+        #         legend='brief', height=3, aspect=2.0,  kind='line', err_style='bars',
+        #         row='intensity', 
+        #         errorbar=("sd", 2))
+        # g.axes[-1].tick_params(axis='x', labelrotation=60) 
+
+        # return g
