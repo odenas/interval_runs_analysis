@@ -55,6 +55,13 @@ standard_3x4 = WorkoutConfig(phases=[
     WorkoutPhase("Cd", 120, 'cooldown')
 ], name="standard_3x4")
 
+l2h2_4x4 = WorkoutConfig(phases=[
+    WorkoutPhase(f"R1", 120, 'low'), WorkoutPhase(f"S1", 120, 'high'),
+    WorkoutPhase(f"R2", 120, 'low'), WorkoutPhase(f"S2", 120, 'high'),
+    WorkoutPhase(f"R3", 120, 'low'), WorkoutPhase(f"S3", 120, 'high'),
+    WorkoutPhase("Cd", 120, 'cooldown')
+], name="l2h2_4x4")
+
 xtrainer_4x4 = WorkoutConfig(phases=[
     WorkoutPhase(f"R1", 180, 'low'), WorkoutPhase(f"S1", 180, 'high'),
     WorkoutPhase(f"R2", 180, 'low'), WorkoutPhase(f"S2", 180, 'high'),
